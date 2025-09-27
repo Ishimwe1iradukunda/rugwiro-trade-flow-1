@@ -47,6 +47,8 @@ import { FinancialRecordDialog } from "@/components/financial/FinancialRecordDia
 import { FinancialTable } from "@/components/financial/FinancialTable";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { exportAnimalsCsv, exportAnimalsExcel, exportAnimalsJson } from "@/lib/animals-export";
+import DocumentUpload from "@/components/ui/document-upload";
+import * as XLSX from "xlsx";
 
 // Add a tiny, generic editable demo list for sections without full features yet
 function EditableDemoList({ section }: { section: string }) {
@@ -54,6 +56,8 @@ function EditableDemoList({ section }: { section: string }) {
   const [items, setItems] = useState<Array<{ id: string; name: string; notes?: string }>>([]);
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [importErrors, setImportErrors] = useState<Array<{ rowNumber: number; name?: string; issues: string[] }> | null>(null);
 
   useEffect(() => {
     try {
@@ -86,6 +90,105 @@ function EditableDemoList({ section }: { section: string }) {
     setItems((prev) => prev.filter((it) => it.id !== id));
   };
 
+  // ---- Import/Export helpers for demo sections (Feeds/Health/Production) ----
+  const downloadTemplateCsv = () => {
+    const headers = ["name","notes"];
+    const csv = [headers.join(","), ["Sample item","Optional notes"].join(",")].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${section}_template.csv`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const downloadTemplateExcel = async () => {
+    const ws = XLSX.utils.json_to_sheet([{ name: "Sample item", notes: "Optional notes" }], { header: ["name","notes"] });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Template");
+    XLSX.writeFile(wb, `${section}_template.xlsx`);
+  };
+
+  const exportCsv = () => {
+    const headers = ["id","name","notes"];
+    const rows = items.map((it) => [it.id, it.name, it.notes ?? ""]);
+    const csv = [headers.join(","), ...rows.map((r) => r.map((c) => {
+      const v = String(c ?? "");
+      return v.includes(",") || v.includes("\n") || v.includes('"') ? '"' + v.replaceAll('"','""') + '"' : v;
+    }).join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${section}_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify(items, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${section}_${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const exportErrorsCsv = (errs: Array<{ rowNumber: number; name?: string; issues: string[] }>) => {
+    const headers = ["rowNumber","name","issues"];
+    const rows = errs.map((e) => [String(e.rowNumber), e.name ?? "", e.issues.join("; ")]);
+    const csv = [headers.join(","), ...rows.map((r) => r.map((c) => {
+      const v = String(c ?? "");
+      return v.includes(",") || v.includes("\n") || v.includes('"') ? '"' + v.replaceAll('"','""') + '"' : v;
+    }).join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${section}_import_errors_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const handleImportFile = async (file: File) => {
+    try {
+      setImportBusy(true);
+      setImportErrors(null);
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws) as any[];
+
+      // upsert by name (case-insensitive); name is required
+      const byName = new Map(items.map((it) => [it.name.trim().toLowerCase(), it] as const));
+      let added = 0; let updated = 0; let skipped = 0;
+      const errs: Array<{ rowNumber: number; name?: string; issues: string[] }> = [];
+
+      rows.forEach((r, idx) => {
+        const rowNumber = idx + 1;
+        const lower = Object.fromEntries(Object.entries(r ?? {}).map(([k,v]) => [String(k).toLowerCase(), v])) as Record<string, any>;
+        const nameRaw = (r as any).name ?? lower["name"];
+        const notesRaw = (r as any).notes ?? lower["notes"];
+        const issues: string[] = [];
+        const nameVal = typeof nameRaw === "string" ? nameRaw.trim() : String(nameRaw ?? "").trim();
+        if (!nameVal) {
+          issues.push("Missing name");
+          skipped++;
+          errs.push({ rowNumber, issues });
+          return;
+        }
+        const patch = { name: nameVal, notes: typeof notesRaw === "string" ? notesRaw.trim() : (notesRaw ?? undefined) } as { name: string; notes?: string };
+        const key = nameVal.toLowerCase();
+        const existing = byName.get(key);
+        if (existing) {
+          existing.name = patch.name;
+          existing.notes = patch.notes || existing.notes;
+          updated++;
+        } else {
+          const id = typeof window !== "undefined" && (window.crypto?.randomUUID ? window.crypto.randomUUID() : `id_${Date.now()}_${Math.random().toString(36).slice(2,8)}`);
+          byName.set(key, { id, ...patch });
+          added++;
+        }
+        if (issues.length) errs.push({ rowNumber, name: nameVal, issues });
+      });
+
+      setItems(Array.from(byName.values()).sort((a,b) => (a.name.localeCompare(b.name))));
+      if (errs.length) setImportErrors(errs);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
   return (
     <div className="grid gap-4 lg:grid-cols-12">
       <Card className="lg:col-span-7">
@@ -100,7 +203,7 @@ function EditableDemoList({ section }: { section: string }) {
               <textarea value={notes} onChange={(e) => setNotes(e.target.value)} className="w-full rounded-md border px-3 py-2 text-sm" placeholder="Optional details" rows={2} />
             </div>
           </div>
-          <div className="mt-3 flex items-center gap-2">
+          <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button 
               type="button" 
               className="bg-black text-white hover:bg-black/90 disabled:opacity-50 disabled:cursor-not-allowed" 
@@ -111,7 +214,37 @@ function EditableDemoList({ section }: { section: string }) {
               Add
             </Button>
             <span className="text-xs text-muted-foreground">Press Enter in Name to add</span>
+
+            {/* Import/Export controls */}
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={downloadTemplateExcel} disabled={importBusy}>Template (Excel)</Button>
+              <Button type="button" variant="outline" size="sm" onClick={downloadTemplateCsv} disabled={importBusy}>Template (CSV)</Button>
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                className="hidden"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) handleImportFile(f); e.currentTarget.value = ""; }}
+              />
+              <Button type="button" variant="secondary" size="sm" disabled={importBusy} onClick={() => {
+                const inp = document.createElement('input');
+                inp.type = 'file'; inp.accept = '.xlsx,.xls,.csv';
+                inp.onchange = () => { const f = (inp.files && inp.files[0]); if (f) handleImportFile(f); };
+                inp.click();
+              }}>Import</Button>
+              <Button type="button" variant="outline" size="sm" onClick={exportCsv}>Export CSV</Button>
+              <Button type="button" variant="outline" size="sm" onClick={exportJson}>Export JSON</Button>
+            </div>
           </div>
+
+          {importErrors && importErrors.length > 0 && (
+            <div className="mt-3 rounded-md border border-yellow-300 bg-yellow-50 p-3 text-sm">
+              <p className="font-medium text-yellow-900">Validation issues: {importErrors.length}</p>
+              <p className="text-yellow-900/80">Download a CSV report for details.</p>
+              <div className="mt-2 flex justify-end">
+                <Button type="button" variant="outline" size="sm" onClick={() => exportErrorsCsv(importErrors!)}>Download error report</Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -163,6 +296,19 @@ function EditableDemoList({ section }: { section: string }) {
               ))}
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Generic document uploader to simplify attaching files */}
+      <Card className="lg:col-span-12">
+        <CardContent className="p-4">
+          <DocumentUpload
+            label={`Attach ${section} documents`}
+            description="Upload any related documents (images, PDFs, spreadsheets)."
+            accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt"
+            multiple
+            maxSizeMb={25}
+          />
         </CardContent>
       </Card>
     </div>
